@@ -134,8 +134,11 @@ catch {
 
 $now = Get-Date
 $since = Get-LastRunTime -Path $StatePath -FallbackMinutes $LookbackMinutes
+$sinceFilter = $since.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ss.0Z')
 
-$computers = Get-ADComputer -SearchBase $QuarantineOU -Filter { whenCreated -ge $since } -Properties whenCreated, distinguishedName, operatingSystem |
+$filter = "whenCreated -ge '$sinceFilter'"
+
+$computers = Get-ADComputer -SearchBase $QuarantineOU -Filter $filter -Properties whenCreated, distinguishedName, operatingSystem |
     Sort-Object -Property whenCreated
 
 if (-not $computers) {
