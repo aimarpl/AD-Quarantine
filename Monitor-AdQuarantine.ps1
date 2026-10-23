@@ -1,12 +1,16 @@
-<#
+﻿<#
 .SYNOPSIS
-Scans a quarantine OU for newly created computer objects and emails the AD Ops team.
+Reports computer objects newly created in an Active Directory quarantine OU by email.
 
 .DESCRIPTION
-Use this script to poll a designated Active Directory OU (for example, a quarantine container)
-for computer accounts created since the previous run. Any newly detected objects are reported
-via email so the AD Ops team can move them to the correct OU. The script keeps a lightweight
-state file containing the last run timestamp to avoid duplicate alerts.
+Polls an Active Directory OU or container (for example, the default computer container redirected
+with redircmp.exe) for computer accounts created since the previous run and sends an HTML summary
+to administrators, so the objects can be reviewed and moved to their correct OUs.
+
+The script keeps a small JSON state file with the last successful run time and the objects that were
+already reported. Each run re-queries a short overlap window to tolerate replication delay; objects
+that were already reported are skipped. The state is only updated after the notification has been
+sent, so a failed run is retried on the next execution.
 
 .PARAMETER QuarantineOU
 Distinguished name of the OU or container holding quarantined computer accounts.
@@ -15,59 +19,101 @@ Distinguished name of the OU or container holding quarantined computer accounts.
 SMTP sender address.
 
 .PARAMETER MailTo
-One or more recipient addresses.
+One or more recipient addresses. A single comma- or semicolon-separated string is also accepted,
+which is useful when the script is started with powershell.exe -File.
 
 .PARAMETER SmtpServer
 SMTP relay host.
 
 .PARAMETER SmtpPort
-SMTP port (defaults to 25).
+SMTP port. Defaults to 25.
 
 .PARAMETER UseSsl
 Enable if the SMTP relay requires TLS.
 
 .PARAMETER SmtpCredential
-Credential object used for authenticated SMTP servers.
+Credential object used for authenticated SMTP relays.
+
+.PARAMETER Server
+Domain controller to query. Defaults to the PDC emulator of the current domain, so every run reads
+from the same domain controller.
 
 .PARAMETER LookbackMinutes
-How far back to search when no state file is present. Defaults to 60 minutes.
+How far back to search when no usable state file exists (for example, on the first run).
+Defaults to 60 minutes.
+
+.PARAMETER OverlapMinutes
+Minutes re-queried before the last run time to catch objects that replicated to the queried domain
+controller late. Already reported objects are not reported again. Defaults to 15 minutes.
 
 .PARAMETER StatePath
-Path to the JSON state file that stores the last run timestamp. Defaults to a file named
-`quarantine-state.json` in the same directory as the script.
+Path to the JSON state file. Defaults to quarantine-state.json in the script directory.
 
 .PARAMETER Subject
-Subject line for the notification email.
+Subject line of the notification email.
 
 .EXAMPLE
-# Search the quarantine OU every 15 minutes via Task Scheduler and send a summary email
-powershell.exe -File "C:\Scripts\Monitor-AdQuarantine.ps1" `
+# Run every 15 minutes from Task Scheduler and notify two mailboxes
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "C:\Scripts\Monitor-AdQuarantine.ps1" `
   -QuarantineOU "OU=Computer Quarantine,DC=example,DC=com" `
   -MailFrom "quarantine-monitor@example.com" `
-  -MailTo "adops@example.com" `
-  -SmtpServer "smtp.example.com" `
-  -LookbackMinutes 15
+  -MailTo "ad-admins@example.com,servicedesk@example.com" `
+  -SmtpServer "smtp.example.com"
+
+.EXAMPLE
+# Query a specific domain controller and use an authenticated TLS relay
+$cred = Get-Credential
+.\Monitor-AdQuarantine.ps1 -QuarantineOU "OU=Computer Quarantine,DC=example,DC=com" `
+  -MailFrom "quarantine-monitor@example.com" -MailTo "ad-admins@example.com" `
+  -SmtpServer "smtp.example.com" -SmtpPort 587 -UseSsl -SmtpCredential $cred `
+  -Server "dc01.example.com" -Verbose
 
 .NOTES
-Requires the ActiveDirectory module (for example, RSAT on Windows Server/Windows 10+).
-Run this script with appropriate permissions to read the target OU.
+Author : Łukasz Ślemp (https://github.com/aimarpl)
+Version: 1.1.0
+License: MIT
+
+Requirements:
+- Windows PowerShell 5.1 or PowerShell 7 with the ActiveDirectory module (RSAT).
+- Read access to the quarantine OU and permission to relay mail through the SMTP server.
+
+Send-MailMessage is marked obsolete by Microsoft because it cannot guarantee a secure connection.
+It still works with internal SMTP relays; use -UseSsl where the relay supports TLS.
+
+Exit codes: 0 = success (with or without new objects), 1 = failure (state not updated).
+
+Version history:
+1.1.0 - State file stored as ISO 8601 UTC and read reliably on Windows PowerShell 5.1.
+        Failed queries or emails no longer advance the state; the script exits with code 1.
+        HTML-encode all directory values in the email body.
+        Culture-independent LDAP filter on whenCreated.
+        Query a fixed domain controller (PDC emulator by default) with an overlap window and
+        de-duplication of already reported objects.
+        Accept comma- or semicolon-separated recipients; parameter validation; no Write-Host.
+1.0.0 - Initial release.
 #>
+#Requires -Version 5.1
 
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)]
+    [ValidateNotNullOrEmpty()]
     [string]$QuarantineOU,
 
     [Parameter(Mandatory = $true)]
+    [ValidateNotNullOrEmpty()]
     [string]$MailFrom,
 
     [Parameter(Mandatory = $true)]
+    [ValidateNotNullOrEmpty()]
     [string[]]$MailTo,
 
     [Parameter(Mandatory = $true)]
+    [ValidateNotNullOrEmpty()]
     [string]$SmtpServer,
 
     [Parameter()]
+    [ValidateRange(1, 65535)]
     [int]$SmtpPort = 25,
 
     [Parameter()]
@@ -77,85 +123,203 @@ param(
     [System.Management.Automation.PSCredential]$SmtpCredential,
 
     [Parameter()]
+    [string]$Server,
+
+    [Parameter()]
+    [ValidateRange(1, 525600)]
     [int]$LookbackMinutes = 60,
 
     [Parameter()]
+    [ValidateRange(0, 1440)]
+    [int]$OverlapMinutes = 15,
+
+    [Parameter()]
+    [ValidateNotNullOrEmpty()]
     [string]$StatePath = (Join-Path -Path $PSScriptRoot -ChildPath 'quarantine-state.json'),
 
     [Parameter()]
+    [ValidateNotNullOrEmpty()]
     [string]$Subject = 'New quarantine computer objects detected'
 )
 
-function Get-LastRunTime {
-    param(
-        [string]$Path,
-        [int]$FallbackMinutes
-    )
+$ErrorActionPreference = 'Stop'
+$invariant = [System.Globalization.CultureInfo]::InvariantCulture
 
-    if (-not (Test-Path -Path $Path)) {
-        return (Get-Date).AddMinutes(-1 * $FallbackMinutes)
+function ConvertTo-UtcDateTime {
+    param([object]$Value)
+
+    if ($null -eq $Value) { return $null }
+
+    if ($Value -is [datetime]) {
+        if ($Value.Kind -eq [System.DateTimeKind]::Utc) { return $Value }
+        return $Value.ToUniversalTime()
+    }
+
+    $parsed = [datetime]::MinValue
+    $styles = [System.Globalization.DateTimeStyles]::AssumeUniversal -bor [System.Globalization.DateTimeStyles]::AdjustToUniversal
+    if ([datetime]::TryParse([string]$Value, $invariant, $styles, [ref]$parsed)) {
+        return $parsed
+    }
+
+    return $null
+}
+
+function ConvertTo-LocalDisplayTime {
+    param([datetime]$Value)
+
+    if ($Value.Kind -eq [System.DateTimeKind]::Utc) { $Value = $Value.ToLocalTime() }
+    return $Value.ToString('yyyy-MM-dd HH:mm:ss', $invariant)
+}
+
+function ConvertTo-HtmlText {
+    param([object]$Value)
+
+    return [System.Net.WebUtility]::HtmlEncode([string]$Value)
+}
+
+function Read-QuarantineState {
+    param([string]$Path)
+
+    $state = [pscustomobject]@{
+        LastRunUtc = $null
+        Reported   = @()
+    }
+
+    if (-not (Test-Path -LiteralPath $Path)) {
+        return $state
     }
 
     try {
-        $content = Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json
-        $parsed = $null
-        if ($null -ne $content.LastRun -and [DateTime]::TryParse($content.LastRun, [ref]$parsed)) {
-            return [DateTime]$parsed
+        $json = Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json
+        $state.LastRunUtc = ConvertTo-UtcDateTime -Value $json.LastRun
+
+        if ($json.PSObject.Properties['Reported']) {
+            $state.Reported = @(
+                foreach ($entry in @($json.Reported)) {
+                    if ($null -eq $entry -or -not $entry.ObjectGuid) { continue }
+                    $whenCreatedUtc = ConvertTo-UtcDateTime -Value $entry.WhenCreated
+                    if ($null -eq $whenCreatedUtc) { continue }
+                    [pscustomobject]@{
+                        ObjectGuid     = [string]$entry.ObjectGuid
+                        WhenCreatedUtc = $whenCreatedUtc
+                    }
+                }
+            )
         }
     }
     catch {
-        Write-Warning "Unable to parse state file at '$Path'. Using fallback lookback window."
+        Write-Warning "State file '$Path' could not be read ($($_.Exception.Message)). Using the lookback window."
+        $state.LastRunUtc = $null
+        $state.Reported = @()
+        return $state
     }
 
-    return (Get-Date).AddMinutes(-1 * $FallbackMinutes)
+    if ($null -eq $state.LastRunUtc) {
+        Write-Warning "State file '$Path' has no valid LastRun value. Using the lookback window."
+    }
+
+    return $state
 }
 
-function Save-LastRunTime {
+function Save-QuarantineState {
     param(
         [string]$Path,
-        [DateTime]$Timestamp
+        [datetime]$LastRunUtc,
+        [object[]]$Reported
     )
 
     $directory = Split-Path -Path $Path -Parent
-    if (-not [string]::IsNullOrWhiteSpace($directory) -and -not (Test-Path -Path $directory)) {
+    if (-not [string]::IsNullOrWhiteSpace($directory) -and -not (Test-Path -LiteralPath $directory)) {
         New-Item -ItemType Directory -Path $directory -Force | Out-Null
     }
 
-    @{ LastRun = $Timestamp } | ConvertTo-Json | Set-Content -LiteralPath $Path -Encoding UTF8
+    $data = [ordered]@{
+        LastRun  = $LastRunUtc.ToString('o', $invariant)
+        Reported = @(
+            foreach ($entry in @($Reported)) {
+                if ($null -eq $entry) { continue }
+                [ordered]@{
+                    ObjectGuid  = $entry.ObjectGuid
+                    WhenCreated = $entry.WhenCreatedUtc.ToString('o', $invariant)
+                }
+            }
+        )
+    }
+
+    # Write to a temporary file first so an interrupted run cannot leave a truncated state file.
+    $tempPath = "$Path.tmp"
+    $data | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $tempPath -Encoding UTF8
+    Move-Item -LiteralPath $tempPath -Destination $Path -Force
 }
 
 try {
-    Import-Module ActiveDirectory -ErrorAction Stop
-}
-catch {
-    Write-Error 'ActiveDirectory module is required. Install RSAT or run on a domain-joined host.'
-    exit 1
-}
+    try {
+        Import-Module -Name ActiveDirectory -ErrorAction Stop -Verbose:$false
+    }
+    catch {
+        throw "The ActiveDirectory module is required (install RSAT or run on a domain controller). $($_.Exception.Message)"
+    }
 
-$now = Get-Date
-$since = Get-LastRunTime -Path $StatePath -FallbackMinutes $LookbackMinutes
-$sinceFilter = $since.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ss.0Z')
+    $recipients = @($MailTo -split '[,;]' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+    if ($recipients.Count -eq 0) {
+        throw 'MailTo does not contain any recipient address.'
+    }
 
-$filter = "whenCreated -ge '$sinceFilter'"
+    if ([string]::IsNullOrWhiteSpace($Server)) {
+        $Server = (Get-ADDomain).PDCEmulator
+    }
+    Write-Verbose "Querying domain controller '$Server'."
 
-$computers = Get-ADComputer -SearchBase $QuarantineOU -Filter $filter -Properties whenCreated, distinguishedName, operatingSystem |
-    Sort-Object -Property whenCreated
+    $nowUtc = (Get-Date).ToUniversalTime()
+    $state = Read-QuarantineState -Path $StatePath
 
-if (-not $computers) {
-    Write-Host "No new computer objects found since $($since.ToString('s'))."
-    Save-LastRunTime -Path $StatePath -Timestamp $now
-    return
-}
+    if ($null -ne $state.LastRunUtc) {
+        $sinceUtc = $state.LastRunUtc
+    }
+    else {
+        $sinceUtc = $nowUtc.AddMinutes(-1 * $LookbackMinutes)
+    }
 
-$rows = $computers | ForEach-Object {
-    $created = $_.whenCreated.ToLocalTime().ToString('yyyy-MM-dd HH:mm:ss')
-    $dn = $_.distinguishedName
-    $os = if ($_.operatingSystem) { $_.operatingSystem } else { 'Unknown' }
+    $queryFromUtc = $sinceUtc.AddMinutes(-1 * $OverlapMinutes)
+    $ldapFilter = '(whenCreated>={0})' -f $queryFromUtc.ToString('yyyyMMddHHmmss.0Z', $invariant)
+    Write-Verbose "Searching '$QuarantineOU' with LDAP filter $ldapFilter."
 
-    "<tr><td>$($_.Name)</td><td>$created</td><td>$os</td><td>$dn</td></tr>"
-} -join "`n"
+    $reportedGuids = @{}
+    foreach ($entry in $state.Reported) {
+        $reportedGuids[$entry.ObjectGuid] = $true
+    }
 
-$emailBody = @"
+    $found = @(
+        Get-ADComputer -Server $Server -SearchBase $QuarantineOU -SearchScope Subtree `
+            -LDAPFilter $ldapFilter -Properties whenCreated, operatingSystem
+    )
+
+    $newComputers = @(
+        $found |
+            Where-Object { -not $reportedGuids.ContainsKey($_.ObjectGUID.ToString()) } |
+            Sort-Object -Property whenCreated
+    )
+
+    # Keep only entries that the next run's overlap window can return again.
+    $keepFromUtc = $nowUtc.AddMinutes(-1 * $OverlapMinutes)
+    $reported = @($state.Reported | Where-Object { $_.WhenCreatedUtc -ge $keepFromUtc })
+
+    if ($newComputers.Count -eq 0) {
+        Save-QuarantineState -Path $StatePath -LastRunUtc $nowUtc -Reported $reported
+        Write-Output "No new computer objects found since $(ConvertTo-LocalDisplayTime -Value $sinceUtc)."
+        exit 0
+    }
+
+    $rows = foreach ($computer in $newComputers) {
+        $os = if ($computer.operatingSystem) { $computer.operatingSystem } else { 'Unknown' }
+        '<tr><td>{0}</td><td>{1}</td><td>{2}</td><td>{3}</td></tr>' -f `
+            (ConvertTo-HtmlText -Value $computer.Name),
+            (ConvertTo-HtmlText -Value (ConvertTo-LocalDisplayTime -Value $computer.whenCreated)),
+            (ConvertTo-HtmlText -Value $os),
+            (ConvertTo-HtmlText -Value $computer.DistinguishedName)
+    }
+
+    $emailBody = @"
 <html>
 <head>
 <style>
@@ -165,32 +329,47 @@ th { background-color: #f2f2f2; }
 </style>
 </head>
 <body>
-<p>The following computer objects were created in the quarantine OU since <strong>$($since.ToLocalTime().ToString('yyyy-MM-dd HH:mm:ss'))</strong>:</p>
+<p>The following computer objects were created in <strong>$(ConvertTo-HtmlText -Value $QuarantineOU)</strong>
+since <strong>$(ConvertTo-LocalDisplayTime -Value $sinceUtc)</strong>:</p>
 <table>
 <thead><tr><th>Name</th><th>Created</th><th>Operating System</th><th>Distinguished Name</th></tr></thead>
 <tbody>
-$rows
+$($rows -join "`n")
 </tbody>
 </table>
-<p>Please review and move these objects to their correct OUs.</p>
+<p>Please review these objects and move them to their correct OUs.</p>
 </body>
 </html>
 "@
 
-$mailParams = @{
-    From       = $MailFrom
-    To         = $MailTo
-    Subject    = $Subject
-    Body       = $emailBody
-    SmtpServer = $SmtpServer
-    Port       = $SmtpPort
-    BodyAsHtml = $true
+    $mailParams = @{
+        From       = $MailFrom
+        To         = $recipients
+        Subject    = $Subject
+        Body       = $emailBody
+        BodyAsHtml = $true
+        Encoding   = [System.Text.Encoding]::UTF8
+        SmtpServer = $SmtpServer
+        Port       = $SmtpPort
+    }
+
+    if ($UseSsl) { $mailParams.UseSsl = $true }
+    if ($null -ne $SmtpCredential) { $mailParams.Credential = $SmtpCredential }
+
+    Send-MailMessage @mailParams
+
+    foreach ($computer in $newComputers) {
+        $reported += [pscustomobject]@{
+            ObjectGuid     = $computer.ObjectGUID.ToString()
+            WhenCreatedUtc = ConvertTo-UtcDateTime -Value $computer.whenCreated
+        }
+    }
+
+    Save-QuarantineState -Path $StatePath -LastRunUtc $nowUtc -Reported $reported
+    Write-Output "Sent notification for $($newComputers.Count) computer object(s) to $($recipients -join ', ')."
+    exit 0
 }
-
-if ($UseSsl) { $mailParams.UseSsl = $true }
-if ($null -ne $SmtpCredential) { $mailParams.Credential = $SmtpCredential }
-
-Send-MailMessage @mailParams
-Save-LastRunTime -Path $StatePath -Timestamp $now
-
-Write-Host "Sent notification for $($computers.Count) computer object(s)."
+catch {
+    Write-Error -Message "Quarantine monitor failed; state was not updated. $($_.Exception.Message)" -ErrorAction Continue
+    exit 1
+}
