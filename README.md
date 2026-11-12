@@ -1,5 +1,9 @@
 # AD Quarantine Monitor
 
+[![PowerShell 5.1 | 7](https://img.shields.io/badge/PowerShell-5.1%20%7C%207-5391FE?logo=powershell&logoColor=white)](https://learn.microsoft.com/powershell/)
+[![Module: ActiveDirectory](https://img.shields.io/badge/module-ActiveDirectory-0078D4)](https://learn.microsoft.com/powershell/module/activedirectory/)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+
 `Monitor-AdQuarantine.ps1` polls an Active Directory quarantine OU for newly created computer
 objects and emails administrators, so the objects can be reviewed and moved to their proper OUs.
 
